@@ -1,0 +1,212 @@
+name: Database Backup to R2
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+env:
+  SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+  R2_BUCKET: ${{ secrets.R2_BUCKET }}
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Get timestamp and backup metadata
+        id: meta
+        run: |
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+          HOUR=$(date -u +"%H")
+          DAY_OF_WEEK=$(date -u +"%u")
+          DATE=$(date -u +"%Y-%m-%d")
+
+          echo "timestamp=$TIMESTAMP" >> "$GITHUB_OUTPUT"
+          echo "hour=$HOUR" >> "$GITHUB_OUTPUT"
+          echo "day_of_week=$DAY_OF_WEEK" >> "$GITHUB_OUTPUT"
+          echo "date=$DATE" >> "$GITHUB_OUTPUT"
+
+      - name: Detect Postgres version from server
+        id: pgversion
+        run: |
+          PG_VERSION=$(psql "$SUPABASE_DB_URL" -t -A -c "SHOW server_version;" 2>/dev/null | cut -d'.' -f1)
+          if [ -z "$PG_VERSION" ]; then
+            PG_VERSION="17"
+            echo "Could not detect version, defaulting to $PG_VERSION"
+          fi
+          echo "version=$PG_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected Postgres version: $PG_VERSION"
+
+      - name: Install matching PostgreSQL client
+        env:
+          PG_VERSION: ${{ steps.pgversion.outputs.version }}
+        run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/postgresql.gpg
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq "postgresql-client-${PG_VERSION}"
+          pg_dump --version
+
+      - name: Create backup directory
+        run: mkdir -p backups
+
+      - name: Dump schema
+        run: |
+          pg_dump "$SUPABASE_DB_URL" \
+            --schema-only \
+            --no-owner \
+            --no-privileges \
+            --format=plain \
+            -f backups/schema.sql
+          echo "Schema dump size: $(du -h backups/schema.sql | cut -f1)"
+
+      - name: Dump data
+        run: |
+          pg_dump "$SUPABASE_DB_URL" \
+            --data-only \
+            --no-owner \
+            --no-privileges \
+            --format=custom \
+            --compress=9 \
+            -f backups/data.dump
+          echo "Data dump size: $(du -h backups/data.dump | cut -f1)"
+
+      - name: Dump roles
+        run: |
+          pg_dumpall "$SUPABASE_DB_URL" \
+            --roles-only \
+            --no-role-passwords \
+            -f backups/roles.sql 2>/dev/null || echo "-- Roles dump not available" > backups/roles.sql
+          echo "Roles dump size: $(du -h backups/roles.sql | cut -f1)"
+
+      - name: Create compressed archive
+        id: archive
+        env:
+          TIMESTAMP: ${{ steps.meta.outputs.timestamp }}
+        run: |
+          ARCHIVE="formline-backup-${TIMESTAMP}.tar.gz"
+          tar -czf "backups/${ARCHIVE}" -C backups schema.sql data.dump roles.sql
+          echo "name=${ARCHIVE}" >> "$GITHUB_OUTPUT"
+          echo "Archive size: $(du -h "backups/${ARCHIVE}" | cut -f1)"
+
+      - name: Upload hourly backup to R2
+        env:
+          ARCHIVE: ${{ steps.archive.outputs.name }}
+          TIMESTAMP: ${{ steps.meta.outputs.timestamp }}
+        run: |
+          aws s3 cp "backups/${ARCHIVE}" \
+            "s3://${R2_BUCKET}/hourly/formline-backup-${TIMESTAMP}.tar.gz" \
+            --endpoint-url "$R2_ENDPOINT"
+          echo "Uploaded hourly backup"
+
+      - name: Upload daily backup to R2 (at midnight UTC)
+        if: steps.meta.outputs.hour == '00' || github.event_name == 'workflow_dispatch'
+        env:
+          ARCHIVE: ${{ steps.archive.outputs.name }}
+          DATE: ${{ steps.meta.outputs.date }}
+        run: |
+          aws s3 cp "backups/${ARCHIVE}" \
+            "s3://${R2_BUCKET}/daily/formline-backup-${DATE}.tar.gz" \
+            --endpoint-url "$R2_ENDPOINT"
+          echo "Uploaded daily backup"
+
+      - name: Upload weekly backup to R2 (Sundays at midnight UTC)
+        if: (steps.meta.outputs.hour == '00' && steps.meta.outputs.day_of_week == '7') || github.event_name == 'workflow_dispatch'
+        env:
+          ARCHIVE: ${{ steps.archive.outputs.name }}
+          DATE: ${{ steps.meta.outputs.date }}
+        run: |
+          aws s3 cp "backups/${ARCHIVE}" \
+            "s3://${R2_BUCKET}/weekly/formline-backup-${DATE}.tar.gz" \
+            --endpoint-url "$R2_ENDPOINT"
+          echo "Uploaded weekly backup"
+
+      - name: Verify upload
+        run: |
+          echo "=== Recent hourly backups ==="
+          aws s3 ls "s3://${R2_BUCKET}/hourly/" --endpoint-url "$R2_ENDPOINT" | tail -5
+          echo ""
+          echo "=== Recent daily backups ==="
+          aws s3 ls "s3://${R2_BUCKET}/daily/" --endpoint-url "$R2_ENDPOINT" | tail -5
+          echo ""
+          echo "=== Recent weekly backups ==="
+          aws s3 ls "s3://${R2_BUCKET}/weekly/" --endpoint-url "$R2_ENDPOINT" | tail -5
+
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: backup
+    timeout-minutes: 10
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+    steps:
+      - name: Get retention cutoff dates
+        id: cutoff
+        run: |
+          HOURLY_CUTOFF=$(date -u -d '25 hours ago' +"%Y-%m-%dT%H")
+          DAILY_CUTOFF=$(date -u -d '31 days ago' +"%Y-%m-%d")
+          WEEKLY_CUTOFF=$(date -u -d '91 days ago' +"%Y-%m-%d")
+          echo "hourly=$HOURLY_CUTOFF" >> "$GITHUB_OUTPUT"
+          echo "daily=$DAILY_CUTOFF" >> "$GITHUB_OUTPUT"
+          echo "weekly=$WEEKLY_CUTOFF" >> "$GITHUB_OUTPUT"
+
+      - name: Cleanup old hourly backups (keep last 25)
+        env:
+          CUTOFF: ${{ steps.cutoff.outputs.hourly }}
+        run: |
+          aws s3 ls "s3://${R2_BUCKET}/hourly/" --endpoint-url "$R2_ENDPOINT" | while read -r line; do
+            FILE=$(echo "$line" | awk '{print $4}')
+            if [ -n "$FILE" ]; then
+              FILE_TS=$(echo "$FILE" | grep -oP '\d{4}-\d{2}-\d{2}T\d{2}' || true)
+              if [ -n "$FILE_TS" ] && [[ "$FILE_TS" < "$CUTOFF" ]]; then
+                echo "Deleting old hourly: $FILE"
+                aws s3 rm "s3://${R2_BUCKET}/hourly/$FILE" --endpoint-url "$R2_ENDPOINT"
+              fi
+            fi
+          done
+
+      - name: Cleanup old daily backups (keep last 31)
+        env:
+          CUTOFF: ${{ steps.cutoff.outputs.daily }}
+        run: |
+          aws s3 ls "s3://${R2_BUCKET}/daily/" --endpoint-url "$R2_ENDPOINT" | while read -r line; do
+            FILE=$(echo "$line" | awk '{print $4}')
+            if [ -n "$FILE" ]; then
+              FILE_DATE=$(echo "$FILE" | grep -oP '\d{4}-\d{2}-\d{2}' || true)
+              if [ -n "$FILE_DATE" ] && [[ "$FILE_DATE" < "$CUTOFF" ]]; then
+                echo "Deleting old daily: $FILE"
+                aws s3 rm "s3://${R2_BUCKET}/daily/$FILE" --endpoint-url "$R2_ENDPOINT"
+              fi
+            fi
+          done
+
+      - name: Cleanup old weekly backups (keep last 91 days)
+        env:
+          CUTOFF: ${{ steps.cutoff.outputs.weekly }}
+        run: |
+          aws s3 ls "s3://${R2_BUCKET}/weekly/" --endpoint-url "$R2_ENDPOINT" | while read -r line; do
+            FILE=$(echo "$line" | awk '{print $4}')
+            if [ -n "$FILE" ]; then
+              FILE_DATE=$(echo "$FILE" | grep -oP '\d{4}-\d{2}-\d{2}' || true)
+              if [ -n "$FILE_DATE" ] && [[ "$FILE_DATE" < "$CUTOFF" ]]; then
+                echo "Deleting old weekly: $FILE"
+                aws s3 rm "s3://${R2_BUCKET}/weekly/$FILE" --endpoint-url "$R2_ENDPOINT"
+              fi
+            fi
+          done
+
+      - name: Show backup inventory
+        run: |
+          echo "=== Backup Inventory ==="
+          HOURLY_COUNT=$(aws s3 ls "s3://${R2_BUCKET}/hourly/" --endpoint-url "$R2_ENDPOINT" | wc -l)
+          DAILY_COUNT=$(aws s3 ls "s3://${R2_BUCKET}/daily/" --endpoint-url "$R2_ENDPOINT" | wc -l)
+          WEEKLY_COUNT=$(aws s3 ls "s3://${R2_BUCKET}/weekly/" --endpoint-url "$R2_ENDPOINT" | wc -l)
+          echo "Hourly: $HOURLY_COUNT files"
+          echo "Daily:  $DAILY_COUNT files"
+          echo "Weekly: $WEEKLY_COUNT files"
