@@ -42,34 +42,73 @@ jobs:
       - name: Create backup directory
         run: mkdir -p backups
 
-      - name: Dump schema
+      - name: Diagnose accessible schemas
+        run: |
+          echo "=== Schemas accessible ==="
+          psql "$SUPABASE_DB_URL" -t -A -c "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name;"
+          echo ""
+          echo "=== Tables per schema ==="
+          psql "$SUPABASE_DB_URL" -t -A -c "SELECT schemaname, count(*) FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema') GROUP BY schemaname ORDER BY schemaname;"
+          echo ""
+          echo "=== Total row counts (public) ==="
+          psql "$SUPABASE_DB_URL" -t -A -c "SELECT relname, n_live_tup FROM pg_stat_user_tables WHERE schemaname='public' ORDER BY n_live_tup DESC LIMIT 20;"
+          echo ""
+          echo "=== Database size ==="
+          psql "$SUPABASE_DB_URL" -t -A -c "SELECT pg_size_pretty(pg_database_size(current_database()));"
+
+      - name: Dump full database (schema + data + functions + triggers)
+        run: |
+          pg_dump "$SUPABASE_DB_URL" \
+            --no-owner \
+            --no-privileges \
+            --format=custom \
+            --compress=9 \
+            -N _analytics \
+            -N _realtime \
+            -N _timescaledb_cache \
+            -N _timescaledb_catalog \
+            -N _timescaledb_config \
+            -N _timescaledb_internal \
+            -N pgsodium \
+            -N pgsodium_masks \
+            -N pgtle \
+            -N supabase_functions \
+            -N supabase_migrations \
+            -N graphql \
+            -N graphql_public \
+            -N net \
+            -N tiger \
+            -N tiger_data \
+            -N topology \
+            -f backups/full.dump
+          echo "Full dump size: $(du -h backups/full.dump | cut -f1)"
+
+      - name: Dump schema only (readable SQL)
         run: |
           pg_dump "$SUPABASE_DB_URL" \
             --schema-only \
             --no-owner \
             --no-privileges \
             --format=plain \
+            -N _analytics \
+            -N _realtime \
+            -N _timescaledb_cache \
+            -N _timescaledb_catalog \
+            -N _timescaledb_config \
+            -N _timescaledb_internal \
+            -N pgsodium \
+            -N pgsodium_masks \
+            -N pgtle \
+            -N supabase_functions \
+            -N supabase_migrations \
+            -N graphql \
+            -N graphql_public \
+            -N net \
+            -N tiger \
+            -N tiger_data \
+            -N topology \
             -f backups/schema.sql
           echo "Schema dump size: $(du -h backups/schema.sql | cut -f1)"
-
-      - name: Dump data
-        run: |
-          pg_dump "$SUPABASE_DB_URL" \
-            --data-only \
-            --no-owner \
-            --no-privileges \
-            --format=custom \
-            --compress=9 \
-            -f backups/data.dump
-          echo "Data dump size: $(du -h backups/data.dump | cut -f1)"
-
-      - name: Dump roles
-        run: |
-          pg_dumpall "$SUPABASE_DB_URL" \
-            --roles-only \
-            --no-role-passwords \
-            -f backups/roles.sql 2>/dev/null || echo "-- Roles dump not available" > backups/roles.sql
-          echo "Roles dump size: $(du -h backups/roles.sql | cut -f1)"
 
       - name: Create compressed archive
         id: archive
@@ -77,7 +116,7 @@ jobs:
           TIMESTAMP: ${{ steps.meta.outputs.timestamp }}
         run: |
           ARCHIVE="formline-backup-${TIMESTAMP}.tar.gz"
-          tar -czf "backups/${ARCHIVE}" -C backups schema.sql data.dump roles.sql
+          tar -czf "backups/${ARCHIVE}" -C backups full.dump schema.sql
           echo "name=${ARCHIVE}" >> "$GITHUB_OUTPUT"
           echo "Archive size: $(du -h "backups/${ARCHIVE}" | cut -f1)"
 
