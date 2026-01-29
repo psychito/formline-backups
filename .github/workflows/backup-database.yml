@@ -17,19 +17,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Resolve DB host to IPv4
-        id: resolve
-        run: |
-          DB_HOST=$(echo "$SUPABASE_DB_URL" | sed -E 's|.*@([^:/]+).*|\1|')
-          DB_IPV4=$(dig +short A "$DB_HOST" | head -1)
-          if [ -z "$DB_IPV4" ]; then
-            echo "ERROR: Could not resolve $DB_HOST to IPv4"
-            exit 1
-          fi
-          echo "Resolved $DB_HOST -> $DB_IPV4"
-          RESOLVED_URL=$(echo "$SUPABASE_DB_URL" | sed "s|$DB_HOST|$DB_IPV4|")
-          echo "resolved_url=$RESOLVED_URL" >> "$GITHUB_OUTPUT"
-
       - name: Get timestamp and backup metadata
         id: meta
         run: |
@@ -45,10 +32,8 @@ jobs:
 
       - name: Detect Postgres version from server
         id: pgversion
-        env:
-          DB_URL: ${{ steps.resolve.outputs.resolved_url }}
         run: |
-          PG_VERSION=$(psql "$DB_URL" -t -A -c "SHOW server_version;" 2>/dev/null | cut -d'.' -f1)
+          PG_VERSION=$(psql "$SUPABASE_DB_URL" -t -A -c "SHOW server_version;" 2>/dev/null | cut -d'.' -f1)
           if [ -z "$PG_VERSION" ]; then
             PG_VERSION="17"
             echo "Could not detect version, defaulting to $PG_VERSION"
@@ -70,10 +55,8 @@ jobs:
         run: mkdir -p backups
 
       - name: Dump schema
-        env:
-          DB_URL: ${{ steps.resolve.outputs.resolved_url }}
         run: |
-          pg_dump "$DB_URL" \
+          pg_dump "$SUPABASE_DB_URL" \
             --schema-only \
             --no-owner \
             --no-privileges \
@@ -82,10 +65,8 @@ jobs:
           echo "Schema dump size: $(du -h backups/schema.sql | cut -f1)"
 
       - name: Dump data
-        env:
-          DB_URL: ${{ steps.resolve.outputs.resolved_url }}
         run: |
-          pg_dump "$DB_URL" \
+          pg_dump "$SUPABASE_DB_URL" \
             --data-only \
             --no-owner \
             --no-privileges \
@@ -95,10 +76,8 @@ jobs:
           echo "Data dump size: $(du -h backups/data.dump | cut -f1)"
 
       - name: Dump roles
-        env:
-          DB_URL: ${{ steps.resolve.outputs.resolved_url }}
         run: |
-          pg_dumpall "$DB_URL" \
+          pg_dumpall "$SUPABASE_DB_URL" \
             --roles-only \
             --no-role-passwords \
             -f backups/roles.sql 2>/dev/null || echo "-- Roles dump not available" > backups/roles.sql
